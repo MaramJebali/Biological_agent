@@ -1,0 +1,27 @@
+# MCP
+mcp>=1.0.0
+langchain-mcp-adapters>=0.1.0
+
+# LangGraph + Groq
+langgraph>=0.2.0
+langchain-groq>=0.1.0
+langchain-core>=0.2.0
+
+# Neo4j
+neo4j==5.28.1
+
+# Matching
+rapidfuzz>=3.9.0
+
+# Env
+python-dotenv>=1.0.0
+
+# Groq SDK
+groq>=0.37.0
+
+# Streamlit UI
+streamlit>=1.35.0
+
+# Tests
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
