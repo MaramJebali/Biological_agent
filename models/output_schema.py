@@ -1,7 +1,6 @@
 """
 Output Schema for Biological Agent
 Contract between agent and scoring/personalisation server.
-Phase 5: Complete dataclass definitions.
 """
 
 from dataclasses import dataclass, field
@@ -166,6 +165,14 @@ class ProductOutput:
 
 
 @dataclass
+class OrganGlobalAnalysis:
+    unique_chemicals: List[str]
+    total_unique_count: int
+    chemical_frequency: Dict[str, int]
+    products_per_chemical: Dict[str, List[str]]
+
+
+@dataclass
 class GlobalSummary:
     total_products: int
     products_to_avoid: int
@@ -177,6 +184,7 @@ class GlobalSummary:
     high_chemicals: List[str]
     organs_under_pressure: Optional[List[str]]
     depth_used: str
+    organ_global_analysis: Dict[str, OrganGlobalAnalysis]
 
 
 @dataclass
@@ -190,7 +198,10 @@ class FinalReport:
     global_summary: GlobalSummary
 
 
-# Builder functions
+# ============================================================
+# Builder Functions
+# ============================================================
+
 def create_resolution_info(resolution_result: dict, kg_confidence: float) -> ResolutionInfo:
     unresolved = resolution_result.get("unresolved", False)
     match_strat = resolution_result.get("match_strategy", "not_found")

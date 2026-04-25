@@ -1,557 +1,371 @@
+#!/usr/bin/env python3
 """
-Streamlit Interface for Biological Agent - Windows Compatible
-──────────────────────────────────────────────────────────────
-Run: streamlit run app.py
+MCP HOST - Biological Agent Entry Point
+─────────────────────────────────────────
+Usage:
+    python main.py                          # runs with built-in example
+    python main.py --input products.json    # runs with your JSON file
+    python main.py --output report.json     # saves report to file
+    python main.py --verbose                # shows chain of thought
+
+This is the MCP HOST - it:
+- Loads configuration
+- Creates and runs the MCP Client (BiologicalAgent)
+- Displays chain of thought
+- Outputs final report
 """
 
-import streamlit as st
 import asyncio
 import json
 import sys
 import os
+import argparse
 import time
-import subprocess
-import threading
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-
-class SyncMCPClient:
-    """Synchronous MCP Client for Windows compatibility"""
-    
-    def __init__(self, name: str, server_path: str, logger):
-        self.name = name
-        self.server_path = server_path
-        self.logger = logger
-        self.process = None
-    
-    def start(self):
-        """Start the MCP server process (synchronous)"""
-        self.process = subprocess.Popen(
-            [sys.executable, self.server_path],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        # Give server time to start
-        time.sleep(0.5)
-        return self
-    
-    def call(self, tool_name: str, arguments: Dict) -> Dict:
-        """Call a tool synchronously"""
-        self.logger.log_tool_call(self.name, tool_name, arguments)
-        
-        request = {
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments},
-            "id": 1
-        }
-        
-        request_json = json.dumps(request) + "\n"
-        
-        try:
-            self.process.stdin.write(request_json)
-            self.process.stdin.flush()
-            
-            response_line = self.process.stdout.readline()
-            if response_line:
-                response = json.loads(response_line)
-                if "result" in response and "content" in response["result"]:
-                    content = response["result"]["content"]
-                    if content and len(content) > 0:
-                        text = content[0].get("text", "{}")
-                        try:
-                            result = json.loads(text)
-                            self.logger.log_tool_result(result, f"Returned {len(str(result))} bytes")
-                            return result
-                        except:
-                            return {"raw": text}
-                return response
-            return {"error": "No response"}
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def list_tools(self) -> List[Dict]:
-        """List available tools"""
-        request = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
-        request_json = json.dumps(request) + "\n"
-        
-        try:
-            self.process.stdin.write(request_json)
-            self.process.stdin.flush()
-            
-            response_line = self.process.stdout.readline()
-            if response_line:
-                response = json.loads(response_line)
-                if "result" in response and "tools" in response["result"]:
-                    return response["result"]["tools"]
-            return []
-        except Exception as e:
-            self.logger.log_step(f"Error listing tools for {self.name}", str(e), icon="❌")
-            return []
-    
-    def stop(self):
-        """Stop the server process"""
-        if self.process:
-            self.process.terminate()
-            self.process.wait(timeout=5)
+import config
+from agent.agent import BiologicalAgent, run_evaluation
 
 
-class ObservableBiologicalAgent:
-    """Real agent that logs all operations to Streamlit (Windows compatible)"""
-    
-    def __init__(self, logger):
-        self.logger = logger
-        self.clients = {}
-        self.server_paths = {
-            "kg": "servers/kg_server/server.py",
-            "filter": "servers/filter_server/server.py",
-            "combination": "servers/combination_server/server.py",
-            "evaluation": "servers/evaluation_server/server.py",
-        }
-    
-    def initialize(self):
-        self.logger.log_step("Initializing MCP Servers", "Connecting to all 4 MCP servers...")
-        
-        for name, path in self.server_paths.items():
-            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
-            if os.path.exists(full_path):
-                try:
-                    client = SyncMCPClient(name, full_path, self.logger)
-                    client.start()
-                    self.clients[name] = client
-                    tools = client.list_tools()
-                    self.logger.log_step(f"Server: {name}", f"Connected, {len(tools)} tools available", icon="✅")
-                except Exception as e:
-                    self.logger.log_step(f"Server: {name}", f"FAILED to start: {str(e)[:100]}", icon="❌")
-            else:
-                self.logger.log_step(f"Server: {name}", f"NOT FOUND at {path}", icon="⚠️")
-    
-    def shutdown(self):
-        for client in self.clients.values():
-            try:
-                client.stop()
-            except:
-                pass
-    
-    def evaluate(self, products_list: List[Dict]) -> Dict:
-        """Run real evaluation with full MCP tool calls (synchronous)"""
-        
-        self.logger.log_step(
-            "Input Products",
-            f"Analyzing {len(products_list)} product(s)"
-        )
-        
-        # ── Step 1: Extract all ingredients ──────────────────────────────────
-        all_ingredients = []
-        for product in products_list:
-            for ing in product.get("ingredient_list", []):
-                all_ingredients.append(ing.get("name"))
-        
-        self.logger.log_step(
-            "Extract Ingredients",
-            f"Found {len(all_ingredients)} total ingredients:\n{', '.join(all_ingredients[:20])}{'...' if len(all_ingredients) > 20 else ''}"
-        )
-        
-        # ── Step 2: Filter ingredients (call filter server) ──────────────────
-        self.logger.log_step("Filtering Ingredients", "Calling filter_server.classify_ingredients...")
-        
-        if "filter" in self.clients:
-            filter_result = self.clients["filter"].call("classify_ingredients", {
-                "ingredient_names": all_ingredients
-            })
-            
-            if isinstance(filter_result, dict):
-                chemicals = filter_result.get("chemicals", [])
-                non_chemicals = filter_result.get("safe_skipped", filter_result.get("non_chemicals", []))
-            else:
-                chemicals = all_ingredients
-                non_chemicals = []
-        else:
-            chemicals = all_ingredients
-            non_chemicals = []
-        
-        self.logger.log_step(
-            "Filter Results",
-            f"🔬 **Chemicals to analyze:** {len(chemicals)}\n"
-            f"✅ **Safe to skip:** {len(non_chemicals)}\n\n"
-            f"Chemicals: {', '.join(chemicals[:10])}{'...' if len(chemicals) > 10 else ''}"
-        )
-        
-        # ── Step 3: Analyze each chemical with KG server ─────────────────────
-        self.logger.log_step("Chemical Analysis", f"Processing {len(chemicals)} chemical(s)...")
-        
-        chemical_findings = []
-        
-        for chem in chemicals[:15]:  # Limit for demo performance
-            self.logger.log_step(f"Analyzing: {chem}", "", icon="🔬")
-            
-            if "kg" not in self.clients:
-                self.logger.log_decision(chem, "NO KG SERVER", "KG server not available", "critical")
-                continue
-            
-            # Call resolve_ingredient
-            resolve_result = self.clients["kg"].call("resolve_ingredient", {
-                "ingredient_name": chem
-            })
-            
-            if resolve_result.get("unresolved", False):
-                self.logger.log_decision(
-                    chem,
-                    "UNRESOLVED - LLM Fallback",
-                    f"Not found in Knowledge Graph. Using LLM estimate.",
-                    "moderate"
-                )
-                chemical_findings.append({
-                    "name": chem,
-                    "risk_level": "UNKNOWN",
-                    "unresolved": True,
-                    "h_codes": []
-                })
-                continue
-            
-            uid = resolve_result.get("uid")
-            self.logger.log_decision(
-                chem,
-                f"RESOLVED → UID: {uid[:20] if uid else 'N/A'}...",
-                f"Found in KG via {resolve_result.get('match_strategy', 'unknown')}",
-                "low"
-            )
-            
-            # Call get_hazard_profile
-            hazard_result = self.clients["kg"].call("get_hazard_profile", {
-                "chemical_uid": uid
-            })
-            
-            h_codes = hazard_result.get("h_codes", [])
-            signal = hazard_result.get("highest_signal", "None")
-            has_critical = hazard_result.get("has_critical_hazard", False)
-            
-            # Determine risk level based on hazards
-            if has_critical:
-                risk_level = "CRITICAL"
-            elif signal == "Danger":
-                risk_level = "HIGH"
-            elif signal == "Warning":
-                risk_level = "MODERATE"
-            elif h_codes:
-                risk_level = "LOW"
-            else:
-                risk_level = "LOW"
-            
-            self.logger.log_decision(
-                chem,
-                f"RISK LEVEL: {risk_level}",
-                f"H-codes: {h_codes[:5]}{'...' if len(h_codes) > 5 else ''} | Signal: {signal}",
-                risk_level.lower()
-            )
-            
-            # If HIGH or CRITICAL, get full profile
-            if risk_level in ["HIGH", "CRITICAL"]:
-                self.logger.log_step(f"Deep Investigation: {chem}", f"Getting full profile...", icon="🔍")
-                
-                full_profile = self.clients["kg"].call("get_full_profile", {
-                    "chemical_uid": uid
-                })
-                
-                organs = full_profile.get("target_organs", [])
-                if organs:
-                    self.logger.log_tool_result(full_profile, f"Target organs: {', '.join(organs)}")
-            
-            chemical_findings.append({
-                "name": chem,
-                "risk_level": risk_level,
-                "h_codes": h_codes,
-                "signal": signal,
-                "uid": uid,
-                "unresolved": False
-            })
-        
-        # ── Step 4: Combination analysis (if multiple chemicals) ─────────────
-        if len(chemical_findings) >= 2 and "combination" in self.clients:
-            self.logger.log_step("Combination Analysis", "Checking for organ overlaps...", icon="🔄")
-            
-            # Get target organs for each resolved chemical
-            chemicals_with_organs = []
-            for finding in chemical_findings:
-                if not finding.get("unresolved") and finding.get("uid"):
-                    organs_result = self.clients["kg"].call("get_target_organs", {
-                        "chemical_uid": finding["uid"]
-                    })
-                    chemicals_with_organs.append({
-                        "name": finding["name"],
-                        "uid": finding["uid"],
-                        "target_organs": organs_result.get("organs", [])
-                    })
-            
-            if chemicals_with_organs:
-                overlap_result = self.clients["combination"].call("check_organ_overlap", {
-                    "chemicals": chemicals_with_organs
-                })
-                
-                if overlap_result.get("has_overlap"):
-                    overlaps = overlap_result.get("overlapping_organs", {})
-                    self.logger.log_step(
-                        "Organ Overlap Detected!",
-                        "\n".join([f"- {organ}: {', '.join(chems)}" for organ, chems in overlaps.items()]),
-                        icon="⚠️"
-                    )
-        
-        # ── Step 5: Generate final report ────────────────────────────────────
-        self.logger.log_step("Synthesizing Report", "Generating final safety assessment...", icon="📝")
-        
-        high_risk = [f for f in chemical_findings if f["risk_level"] in ["CRITICAL", "HIGH"]]
-        moderate_risk = [f for f in chemical_findings if f["risk_level"] == "MODERATE"]
-        
-        if high_risk:
-            overall_risk = "HIGH"
-            recommendation = "avoid"
-        elif moderate_risk:
-            overall_risk = "MODERATE"
-            recommendation = "reduce_use"
-        else:
-            overall_risk = "LOW"
-            recommendation = "keep"
-        
-        report = {
-            "analyzed_at": datetime.now().isoformat(),
-            "products_count": len(products_list),
-            "chemicals_analyzed": len(chemical_findings),
-            "overall_risk": overall_risk,
-            "recommendation": recommendation,
-            "chemical_findings": chemical_findings,
-            "high_risk_chemicals": [c["name"] for c in high_risk],
-            "moderate_risk_chemicals": [c["name"] for c in moderate_risk]
-        }
-        
-        return report
+# ============================================================
+# CHAIN OF THOUGHT LOGGER (for MCP Host)
+# ============================================================
 
-
-class StreamlitReasoningLogger:
-    """Logs agent reasoning to Streamlit interface"""
+class ChainOfThoughtLogger:
+    """
+    Displays the agent's chain of thought in the console.
+    This runs in the HOST, not in the CLIENT.
+    """
     
-    def __init__(self):
+    def __init__(self, verbose: bool = True):
+        self.verbose = verbose
         self.step_num = 0
         self.start_time = None
-        self.status_placeholder = None
+        self.indent = 0
     
     def start(self):
         self.start_time = time.time()
-        self.status_placeholder = st.empty()
-        self.status_placeholder.info("🧠 **Agent Started** — Initializing MCP servers...")
+        self._print_section("🧠 BIOLOGICAL AGENT STARTED")
+        self._print(f"Agent version: 2.0.0")
+        self._print(f"Mode: {'Verbose' if self.verbose else 'Quiet'}")
+        self._print(f"Started at: {datetime.now().isoformat()}")
+        self._print("")
     
-    def log_step(self, title: str, content: str = "", icon: str = "🔍"):
-        self.step_num += 1
-        with st.container():
-            st.markdown(f"""
-            <div style="background-color: #f0f7ff; border-radius: 10px; padding: 12px; margin: 8px 0; border-left: 4px solid #2196f3;">
-                <b>{icon} Step {self.step_num}: {title}</b><br>
-                {content}
-            </div>
-            """, unsafe_allow_html=True)
+    def _print(self, msg: str, level: str = "info"):
+        if not self.verbose and level == "debug":
+            return
+        print(msg)
+        sys.stdout.flush()
     
-    def log_tool_call(self, server: str, tool: str, args: Dict):
-        with st.container():
-            args_preview = json.dumps(args, indent=2)[:200]
-            st.markdown(f"""
-            <div style="background-color: #e3f2fd; border-radius: 8px; padding: 8px; margin: 4px 0; font-family: monospace; font-size: 12px;">
-                🔧 <b>CALL:</b> {server}.{tool}<br>
-                📦 <b>Args:</b> <code>{args_preview}{'...' if len(json.dumps(args)) > 200 else ''}</code>
-            </div>
-            """, unsafe_allow_html=True)
+    def _print_section(self, title: str):
+        print("\n" + "=" * 70)
+        print(f"  {title}")
+        print("=" * 70)
     
-    def log_tool_result(self, result: Dict, summary: str = ""):
-        with st.container():
-            result_preview = json.dumps(result, indent=2)[:300]
-            st.markdown(f"""
-            <div style="background-color: #e8f5e9; border-radius: 8px; padding: 8px; margin: 4px 0; font-family: monospace; font-size: 12px;">
-                📥 <b>RESULT:</b> {summary}<br>
-                <details>
-                    <summary>View full response</summary>
-                    <pre style="font-size: 10px;">{result_preview}...</pre>
-                </details>
-            </div>
-            """, unsafe_allow_html=True)
+    def _print_subsection(self, title: str):
+        print(f"\n  📌 {title}")
+        print("  " + "-" * 50)
     
-    def log_decision(self, chemical: str, decision: str, reason: str, risk_color: str = "blue"):
-        colors = {
-            "critical": "#ffebee",
-            "high": "#fff3e0",
-            "moderate": "#fff8e1",
-            "low": "#e8f5e9"
-        }
-        bg = colors.get(risk_color, "#f5f5f5")
-        with st.container():
-            st.markdown(f"""
-            <div style="background-color: {bg}; border-radius: 10px; padding: 12px; margin: 8px 0; border-left: 4px solid #ff9800;">
-                <b>🧪 DECISION for {chemical}</b><br>
-                → <b>{decision}</b><br>
-                → {reason}
-            </div>
-            """, unsafe_allow_html=True)
+    def log_input_parsing(self, products_list: List[Dict]):
+        self._print_subsection("INPUT PARSING")
+        self._print(f"  📦 Received {len(products_list)} product(s)")
+        for i, p in enumerate(products_list):
+            pid = p.get("product_id", "?")
+            name = p.get("product_name", "Unknown")
+            usage = p.get("product_usage", "unknown")
+            exposure = p.get("exposure_type", "unknown")
+            ingredients = len(p.get("ingredient_list", []))
+            self._print(f"     Product {i+1}: {name} (ID: {pid})")
+            self._print(f"        Usage: {usage} | Exposure: {exposure} | {ingredients} ingredients")
     
-    def update_status(self, message: str):
-        if self.status_placeholder:
-            self.status_placeholder.info(message)
+    def log_product_context(self, context: dict):
+        self._print_subsection("PRODUCT CONTEXT ANALYSIS")
+        self._print(f"  📊 Product count: {context.get('product_count')}")
+        self._print(f"  🔄 Needs cumulative analysis: {context.get('needs_cumulative')}")
+        self._print(f"  🔀 Mixed usage types: {context.get('has_mixed_usage')}")
+        self._print(f"  🎯 Strategy: {context.get('strategy')}")
+    
+    def log_server_connection(self, server_name: str, tools_count: int):
+        if self.verbose:
+            self._print(f"  ✅ {server_name} server: {tools_count} tools", "debug")
+    
+    def log_filter_result(self, chemicals: list, safe_skipped: list):
+        self._print_subsection("FILTER RESULTS")
+        self._print(f"  🔬 Chemicals to analyze: {len(chemicals)}")
+        self._print(f"  ✅ Safe to skip: {len(safe_skipped)}")
+        if self.verbose and chemicals:
+            self._print(f"     Chemicals: {', '.join(chemicals[:10])}{'...' if len(chemicals) > 10 else ''}")
+    
+    def log_chemical_investigation_start(self, total: int):
+        self._print_subsection("CHEMICAL INVESTIGATION")
+        self._print(f"  🔍 Processing {total} chemical(s)...")
+    
+    def log_chemical_resolution(self, name: str, uid: Optional[str], match_strategy: str):
+        if uid:
+            self._print(f"     🔬 {name}: RESOLVED → {uid[:20]}... ({match_strategy})")
+        else:
+            self._print(f"     🔬 {name}: UNRESOLVED → using LLM fallback")
+    
+    def log_chemical_hazard(self, name: str, risk_level: str, h_codes: list, signal: str):
+        risk_emoji = {
+            "CRITICAL": "🔴", "HIGH": "🟠", "MODERATE": "🟡", "LOW": "🟢", "SAFE": "✅", "UNKNOWN": "❓"
+        }.get(risk_level, "⚪")
+        h_preview = ', '.join(h_codes[:3])
+        self._print(f"        {risk_emoji} Risk: {risk_level} | Signal: {signal} | H-codes: {h_preview}{'...' if len(h_codes) > 3 else ''}")
+    
+    def log_deep_investigation(self, name: str, organs: list):
+        self._print(f"        🔍 Deep investigation: target organs = {organs}")
+    
+    def log_confidence(self, name: str, confidence: float, source: str):
+        if self.verbose:
+            self._print(f"        📊 Confidence: {confidence:.2f} ({source})", "debug")
+    
+    def log_combination_start(self):
+        self._print_subsection("COMBINATION ANALYSIS")
+    
+    def log_organ_overlap(self, overlaps: dict):
+        if overlaps:
+            self._print(f"  🧠 Organ overlaps detected:")
+            for organ, data in overlaps.items():
+                if isinstance(data, dict):
+                    chemicals = data.get("chemicals", [])
+                    count = data.get("total_unique_count", len(chemicals))
+                    self._print(f"     • {organ}: {count} unique chemical(s)")
+                    if self.verbose:
+                        self._print(f"       Chemicals: {', '.join(chemicals[:5])}{'...' if len(chemicals) > 5 else ''}")
+                elif isinstance(data, list):
+                    for o in data:
+                        self._print(f"     • {o.get('organ')}: {o.get('count')} chemical(s)")
+        else:
+            self._print(f"  ✅ No significant organ overlaps detected")
+    
+    def log_cumulative_presence(self, cumulative: list):
+        if cumulative:
+            self._print(f"  📦 Cumulative exposure detected:")
+            for c in cumulative:
+                self._print(f"     • {c.get('chemical_name')} appears in {c.get('frequency')} products")
+    
+    def log_escalation_enforcement(self, escalation: str):
+        if escalation == "HIGH":
+            self._print(f"\n  ⚠️ ESCALATION ENFORCED: verdict_escalation = HIGH")
+            self._print(f"     → Product risk levels forced to HIGH")
+    
+    def log_completion(self, elapsed: float, report_keys: list):
+        self._print_section("AGENT COMPLETE")
+        self._print(f"  ✅ Analysis completed in {elapsed:.1f} seconds")
+        self._print(f"  📄 Report contains: {', '.join(report_keys)}")
     
     def finish(self, elapsed: float):
-        if self.status_placeholder:
-            self.status_placeholder.success(f"✅ **Analysis Complete** — {elapsed:.1f} seconds")
+        print(f"\n✅ Analysis completed in {elapsed:.1f} seconds")
         return elapsed
 
 
-def clean_json_input(raw_text: str) -> str:
-    """Clean and extract JSON from raw input"""
-    import re
-    raw_text = raw_text.strip()
-    if raw_text.startswith("[PRODUCTS_LIST]"):
-        raw_text = raw_text.replace("[PRODUCTS_LIST]", "").strip()
-    json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-    if json_match:
-        return json_match.group()
-    return raw_text
+# ============================================================
+# OUTPUT FORMATTERS
+# ============================================================
 
-
-def parse_input(raw_text: str) -> tuple:
-    """Parse input and return products_list"""
-    try:
-        cleaned = clean_json_input(raw_text)
-        data = json.loads(cleaned)
-        if "products_list" in data:
-            products_list = data["products_list"]
-        else:
-            products_list = data
-        if isinstance(products_list, dict):
-            products_list = [products_list]
-        if not isinstance(products_list, list):
-            return False, None, "Expected array of products"
-        return True, products_list, None
-    except json.JSONDecodeError as e:
-        return False, None, f"JSON error: {e.msg} at position {e.pos}"
-
-
-def run_agent_sync(products_list: List[Dict], logger: StreamlitReasoningLogger) -> Dict:
-    """Run agent synchronously (for Streamlit)"""
-    agent = ObservableBiologicalAgent(logger)
-    try:
-        agent.initialize()
-        report = agent.evaluate(products_list)
-        return report
-    finally:
-        agent.shutdown()
-
-
-def main():
-    st.set_page_config(page_title="Biological Agent", page_icon="🧪", layout="wide")
+def format_report_summary(report: dict) -> None:
+    """Pretty print report summary to console"""
+    print("\n" + "=" * 70)
+    print("  FINAL REPORT SUMMARY")
+    print("=" * 70)
     
-    st.title("🧪 Biological Agent")
-    st.markdown("*AI-powered chemical safety analysis using real MCP servers*")
+    # Product verdicts
+    verdicts = report.get("product_verdicts", [])
+    if verdicts:
+        print("\n  📦 PRODUCT VERDICTS:")
+        for v in verdicts:
+            risk = v.get("risk_level", "UNKNOWN")
+            emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MODERATE": "🟡", "LOW": "🟢", "SAFE": "✅"}.get(risk, "⚪")
+            print(f"     {emoji} {v.get('product_name', 'Unknown'):30s} → {risk}")
     
-    with st.sidebar:
-        st.header("📤 Input")
-        
-        input_method = st.radio("Choose input method:", ["📋 Example Product", "📁 Upload JSON", "✏️ Paste JSON"])
-        
-        products_list = None
-        
-        if input_method == "📋 Example Product":
-            example = {
-                "products_list": [{
-                    "product_id": "1",
-                    "ingredient_list": [
-                        {"name": "AQUA"},
-                        {"name": "SODIUM LAURETH SULFATE"},
-                        {"name": "PARFUM"},
-                        {"name": "CITRIC ACID"}
-                    ],
-                    "product_usage": "cosmetics",
-                    "exposure_type": "skin"
-                }]
+    # High risk chemicals
+    chemicals = report.get("chemicals_summary", [])
+    high_risk = [c for c in chemicals if c.get("risk_level") in ["CRITICAL", "HIGH"]]
+    if high_risk:
+        print("\n  ⚠️ HIGH RISK CHEMICALS:")
+        for c in high_risk[:10]:
+            print(f"     • {c.get('name')}: {c.get('risk_level')} (confidence: {c.get('confidence', 0):.2f})")
+    
+    # Organ overlaps
+    combo = report.get("combination_risks", {})
+    organ_summary = combo.get("organ_overlap_summary")
+    if organ_summary and organ_summary != "No organ overlap detected":
+        print(f"\n  🧠 ORGAN OVERLAP: {organ_summary}")
+    
+    # Recommendations
+    print("\n  📋 RECOMMENDATIONS:")
+    recommendations = []
+    for v in verdicts:
+        rec = v.get("recommendation", "")
+        if rec == "avoid":
+            recommendations.append(f"   • {v.get('product_name')}: AVOID")
+        elif rec == "reduce_use":
+            recommendations.append(f"   • {v.get('product_name')}: REDUCE USE")
+        elif rec == "keep":
+            recommendations.append(f"   • {v.get('product_name')}: SAFE TO USE")
+    
+    if recommendations:
+        for r in recommendations:
+            print(r)
+    else:
+        print("   • No specific recommendations")
+
+
+def save_report_to_file(report: dict, output_path: str) -> None:
+    """Save report to JSON file"""
+    with open(output_path, 'w') as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    print(f"\n  💾 Report saved to: {output_path}")
+
+
+# ============================================================
+# MCP HOST - MAIN ENTRY POINT
+# ============================================================
+
+async def run_host(products_list: List[Dict], verbose: bool = True, logger: ChainOfThoughtLogger = None) -> Dict:
+    """
+    Run the MCP Client and capture chain of thought.
+    This is the HOST: creates client, runs it, returns report.
+    """
+    if logger is None:
+        logger = ChainOfThoughtLogger(verbose)
+    
+    logger.start()
+    
+    # Create MCP Client
+    client = BiologicalAgent()
+    
+    # Log client initialization
+    print("\n  🚀 Initializing MCP Client...")
+    
+    # Run client
+    result = await client.run(products_list)
+    
+    # Log completion
+    elapsed = result.get("elapsed_s", 0)
+    report = result.get("report", {})
+    logger.log_completion(elapsed, list(report.keys()) if report else [])
+    
+    return result
+
+
+def load_input(input_path: Optional[str] = None) -> List[Dict]:
+    """Load products_list from file or use example"""
+    if input_path:
+        with open(input_path, 'r') as f:
+            data = json.load(f)
+            if "products_list" in data:
+                return data["products_list"]
+            elif isinstance(data, list):
+                return data
+            else:
+                return [data]
+    else:
+        # Built-in example (Sarah's two products)
+        return [
+            {
+                "product_id": "1",
+                "product_name": "Moisturizing Cream",
+                "product_usage": "cosmetics",
+                "exposure_type": "skin",
+                "ingredient_list": [
+                    {"name": "AQUA"},
+                    {"name": "SODIUM LAURETH SULFATE"},
+                    {"name": "COCO-BETAINE"},
+                    {"name": "SODIUM CHLORIDE"},
+                    {"name": "PARFUM"},
+                    {"name": "CITRIC ACID"},
+                ]
+            },
+            {
+                "product_id": "2",
+                "product_name": "Perfume Spray",
+                "product_usage": "cosmetics",
+                "exposure_type": "skin",
+                "ingredient_list": [
+                    {"name": "ALCOHOL DENAT."},
+                    {"name": "PARFUM"},
+                    {"name": "LIMONENE"},
+                    {"name": "LINALOOL"},
+                ]
             }
-            products_list = example["products_list"]
-            st.success("Using example product")
-            st.json(example)
-        
-        elif input_method == "📁 Upload JSON":
-            uploaded = st.file_uploader("Upload JSON", type=["json"])
-            if uploaded:
-                content = uploaded.read().decode()
-                success, data, error = parse_input(content)
-                if success:
-                    products_list = data
-                    st.success(f"Loaded {len(products_list)} product(s)")
-                else:
-                    st.error(error)
-        
-        else:
-            json_text = st.text_area("Paste JSON:", height=200, 
-                                     placeholder='{"products_list": [{"product_id": "1", "ingredient_list": [{"name": "AQUA"}], "product_usage": "cosmetics", "exposure_type": "skin"}]}')
-            if json_text:
-                success, data, error = parse_input(json_text)
-                if success:
-                    products_list = data
-                    st.success(f"Loaded {len(products_list)} product(s)")
-                else:
-                    st.error(error)
-        
-        analyze = st.button("🚀 Analyze Products", type="primary", use_container_width=True)
+        ]
+
+
+async def main():
+    """MCP HOST - Main entry point"""
+    parser = argparse.ArgumentParser(
+        description="Biological Agent - MCP Host for Chemical Safety Analysis",
+        epilog="Example: python main.py --input products.json --output report.json --verbose"
+    )
+    parser.add_argument("--input", "-i", help="Path to input JSON file")
+    parser.add_argument("--output", "-o", help="Path to save output JSON report")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed chain of thought")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Suppress chain of thought output")
+    args = parser.parse_args()
     
-    if analyze and products_list:
-        st.session_state.analysis_complete = False
-        
-        logger = StreamlitReasoningLogger()
-        logger.start()
-        
-        try:
-            # Run agent synchronously
-            report = run_agent_sync(products_list, logger)
-            elapsed = logger.finish(report.get("elapsed_s", 0))
-            st.session_state.analysis_complete = True
-            st.session_state.report = report
-        except Exception as e:
-            st.error(f"Agent failed: {e}")
-            import traceback
-            st.code(traceback.format_exc())
+    verbose = args.verbose and not args.quiet
     
-    if st.session_state.get("analysis_complete"):
-        report = st.session_state.report
+    # Validate credentials
+    try:
+        config.validate()
+        if verbose:
+            print("✅ Configuration validated")
+            print(f"   Groq model: {config.GROQ_MODEL}")
+            print(f"   Neo4j URI: {config.NEO4J_URI}")
+    except EnvironmentError as e:
+        print(f"❌ Configuration error:\n{e}")
+        sys.exit(1)
+    
+    # Load input
+    try:
+        products_list = load_input(args.input)
+        if verbose:
+            print(f"\n📦 Loaded {len(products_list)} product(s)")
+    except Exception as e:
+        print(f"❌ Failed to load input: {e}")
+        sys.exit(1)
+    
+    # Create logger
+    logger = ChainOfThoughtLogger(verbose)
+    
+    # Run host
+    try:
+        start_time = time.time()
+        result = await run_host(products_list, verbose, logger)
+        elapsed = time.time() - start_time
         
-        st.header("📊 Analysis Results")
+        # Display report
+        report = result.get("report", {})
+        format_report_summary(report)
         
-        overall = report.get("overall_risk", "UNKNOWN")
-        if overall == "HIGH":
-            st.error(f"🔴 Overall Verdict: HIGH RISK")
-        elif overall == "MODERATE":
-            st.warning(f"🟡 Overall Verdict: MODERATE RISK")
-        else:
-            st.success(f"🟢 Overall Verdict: LOW RISK")
+        # Save if requested
+        if args.output:
+            save_report_to_file(report, args.output)
         
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Products Analyzed", report.get("products_count", 0))
-        with col2:
-            st.metric("Chemicals Analyzed", report.get("chemicals_analyzed", 0))
+        # Also print full JSON if verbose
+        if verbose:
+            print("\n" + "=" * 70)
+            print("  FULL REPORT JSON")
+            print("=" * 70)
+            print(json.dumps(report, indent=2)[:2000] + ("\n  ... (truncated)" if len(json.dumps(report)) > 2000 else ""))
         
-        if report.get("high_risk_chemicals"):
-            st.error(f"⚠️ High Risk Chemicals: {', '.join(report['high_risk_chemicals'])}")
-        if report.get("moderate_risk_chemicals"):
-            st.warning(f"⚠️ Moderate Risk Chemicals: {', '.join(report['moderate_risk_chemicals'])}")
+        print(f"\n✅ MCP Host completed in {elapsed:.1f} seconds")
         
-        with st.expander("📄 Full Report JSON", expanded=False):
-            st.json(report)
-        
-        st.download_button(
-            "📥 Download Report", 
-            json.dumps(report, indent=2), 
-            "biological_agent_report.json",
-            "application/json"
-        )
+    except KeyboardInterrupt:
+        print("\n⚠️ Interrupted by user")
+        sys.exit(130)
+    except Exception as e:
+        print(f"\n❌ MCP Host failed: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

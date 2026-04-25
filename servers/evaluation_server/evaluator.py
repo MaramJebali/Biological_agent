@@ -5,6 +5,7 @@ Pure Python logic for data quality assessment and investigation metrics.
 Zero LLM. Zero Neo4j.
 
 PHASE 5 UPDATE: Added confidence scoring and low confidence → UNKNOWN override
+NEW: Added assess_data_completeness function
 """
 
 from __future__ import annotations
@@ -119,7 +120,7 @@ def get_investigation_metrics(
 
     # ============================================================
     # PHASE 5: Adjust risk based on confidence
-    # If confidence is low (<0.4), override risk to UNKNOWN
+    # If confidence is low (<=0.4), override risk to UNKNOWN
     # ============================================================
     reasoning_parts = [f"{chemical_name} resolved via {match_strat}."]
 
@@ -166,7 +167,7 @@ def get_investigation_metrics(
         "has_hazards":        has_hazards,
         "has_danger_signal":  has_danger,
         "has_warning_signal": has_warning,
-        "has_critical_hazard":is_critical,
+        "has_critical_hazard": is_critical,
         "critical_codes":     crit_codes,
         "h_code_count":       len(h_codes),
         "data_completeness":  completeness,
@@ -176,4 +177,72 @@ def get_investigation_metrics(
         "fetch_status":       "complete",
         "confidence":         completeness,
         "kg_confidence":      completeness,
+    }
+
+
+# ============================================================
+# NEW TOOL: assess_data_completeness (Pure Python)
+# ============================================================
+
+def assess_data_completeness(
+    resolution_result: dict,
+    hazard_result: dict,
+    organs_result: dict = None
+) -> dict:
+    """
+    Assess per-field completeness of KG data.
+    Pure Python - NO LLM.
+    """
+    has_uid = resolution_result.get("uid") is not None
+    is_unresolved = resolution_result.get("unresolved", True) or not has_uid
+    
+    if is_unresolved:
+        return {
+            "overall_completeness": 0.0,
+            "fields": {
+                "resolution": {"complete": False, "score": 0.0},
+                "hazards": {"complete": False, "score": 0.0},
+                "organs": {"complete": False, "score": 0.0},
+                "toxicity": {"complete": False, "score": 0.0}
+            },
+            "missing_fields": ["resolution", "hazards", "organs", "toxicity"],
+            "recommendation": "use_llm_fallback"
+        }
+    
+    completeness = {"resolution": 1.0 if has_uid else 0.0}
+    missing = []
+    
+    # Hazard completeness
+    h_codes = hazard_result.get("h_codes", []) if hazard_result else []
+    if h_codes:
+        completeness["hazards"] = 1.0
+    elif hazard_result:
+        completeness["hazards"] = 0.3
+        missing.append("hazards")
+    else:
+        completeness["hazards"] = 0.0
+        missing.append("hazards")
+    
+    # Organs completeness
+    organs = organs_result.get("organs", []) if organs_result else []
+    if organs:
+        completeness["organs"] = 1.0
+    elif organs_result:
+        completeness["organs"] = 0.3
+        missing.append("organs")
+    else:
+        completeness["organs"] = 0.0
+        missing.append("organs")
+    
+    # Toxicity completeness (always incomplete - no dose data)
+    completeness["toxicity"] = 0.0
+    missing.append("toxicity")
+    
+    overall = sum(completeness.values()) / len(completeness)
+    
+    return {
+        "overall_completeness": round(overall, 2),
+        "fields": completeness,
+        "missing_fields": missing,
+        "recommendation": "use_llm_fallback" if missing else "trust_kg"
     }
