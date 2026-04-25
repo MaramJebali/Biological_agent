@@ -51,7 +51,7 @@ SERVER_PATHS = {
 class TokenBudgetManager:
     """Manages Groq token budget to stay within free tier limits"""
     
-    def __init__(self, max_tokens_per_minute=6000, max_llm_calls=5):
+    def __init__(self, max_tokens_per_minute=6000, max_llm_calls=15):
         self.max_tokens = max_tokens_per_minute
         self.max_calls = max_llm_calls
         self.used_tokens = 0
