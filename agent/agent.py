@@ -235,10 +235,18 @@ class BiologicalAgent:
     # ============================================================
 
     def _map_llm_risk_to_level(self, h_codes: list) -> str:
-        """Map LLM estimated H-codes to risk level"""
-        critical = {"H340", "H350", "H360"}
-        high = {"H315", "H317", "H318", "H319", "H334"}
-        moderate = {"H302", "H312", "H332", "H335"}
+        """
+        Map LLM estimated H-codes to risk level.
+        This is used for LLM fallback when chemical not in KG.
+        """
+        # Critical H-codes (carcinogen, mutagen, reprotoxic, organ damage)
+        critical = {"H340", "H341", "H350", "H351", "H360", "H361", "H362", "H370", "H371", "H372"}
+        
+        # High risk H-codes (acute toxicity, severe irritation)
+        high = {"H315", "H317", "H318", "H334", "H330", "H310", "H300"}
+        
+        # Moderate risk H-codes (irritation, mild toxicity)
+        moderate = {"H319", "H302", "H312", "H332", "H335", "H336"}
         
         for code in h_codes:
             if code in critical:
@@ -247,6 +255,8 @@ class BiologicalAgent:
                 return "HIGH"
             if code in moderate:
                 return "MODERATE"
+        
+        # If H-codes present but not in categories above
         return "LOW" if h_codes else "UNKNOWN"
 
     async def _llm_cross_check(self, chemical_name: str, reason: str = "") -> dict:
@@ -338,7 +348,10 @@ class BiologicalAgent:
     # ============================================================
     # Phase B: Investigate each chemical
     # ============================================================
-
+# In _investigate_chemical, add caching
+    @lru_cache(maxsize=100)
+    def _cached_resolve(self, name: str) -> dict:
+        return self._kg("resolve_ingredient", ingredient_name=name)
     async def _investigate_chemical(self, name):
         """TRUE MCP AGENT — each tool result drives the next call."""
         if self.state.is_investigated(name):
@@ -374,19 +387,49 @@ class BiologicalAgent:
         finding["uid"] = uid
         self.state.mark_resolved(name, uid)
 
+        # Get hazard data
         hazard = await self._kg("get_hazard_profile", chemical_uid=uid)
         finding["hazard"] = hazard
 
+        h_codes = hazard.get("h_codes", [])
+        signal = hazard.get("highest_signal", "None")
+        has_critical = hazard.get("has_critical_hazard", False)
+
+        # Critical H-codes for severe toxicity
+        critical_h_codes = {"H340", "H350", "H360", "H341", "H351", "H361", "H362", "H370", "H371", "H372"}
+
+        # ============================================================
+        # CORRECTED RISK MAPPING LOGIC
+        # ============================================================
+        if signal == "Danger":
+            if has_critical or any(code in critical_h_codes for code in h_codes):
+                preliminary_risk = "CRITICAL"
+            else:
+                preliminary_risk = "HIGH"
+        elif signal == "Warning":
+            preliminary_risk = "MODERATE"
+        elif h_codes:
+            preliminary_risk = "LOW"
+        else:
+            preliminary_risk = "SAFE"
+
+        # Get metrics (this may adjust risk based on confidence)
         metrics = await self._eval("get_investigation_metrics", {
             "chemical_name": name,
             "resolution_result": resolution,
             "hazard_result": hazard
         })
+
+        # If metrics returns a different risk (e.g., due to low confidence), use the more conservative one
+        metrics_risk = metrics.get("preliminary_risk", "UNKNOWN")
+        if metrics_risk in ["CRITICAL", "HIGH"] and preliminary_risk not in ["CRITICAL", "HIGH"]:
+            preliminary_risk = metrics_risk
+
         finding["metrics"] = metrics
-        finding["preliminary_risk"] = metrics.get("preliminary_risk", "UNKNOWN")
+        finding["preliminary_risk"] = preliminary_risk
         finding["recommended_depth"] = metrics.get("recommended_depth", "basic")
         finding["reasoning"] = metrics.get("reasoning", "")
-        finding["h_codes"] = hazard.get("h_codes", [])
+        finding["h_codes"] = h_codes
         
         kg_confidence = metrics.get("confidence", metrics.get("kg_confidence", 0.5))
         finding["kg_confidence"] = kg_confidence

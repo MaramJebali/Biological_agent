@@ -1,13 +1,6 @@
 """
 Streamlit Interface for Biological Agent - PRODUCTION VERSION
-───────────────────────────────────────────────────────────────
-Run: streamlit run app.py
-
-FIXES APPLIED:
-1. Variable scope: global_organ_analysis initialized BEFORE conditional
-2. Product tracking: chemical_id_map stores list of product IDs
-3. Removed partial match dependency (handled by KG server)
-4. Added token budget awareness
+Outputs FULL schema compliant with output_schema.py
 """
 
 import streamlit as st
@@ -20,11 +13,21 @@ import subprocess
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from collections import defaultdict
+from functools import lru_cache
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
+from models.output_schema import (
+    FinalReport, ProductOutput, IngredientsSection, ChemicalEvaluation,
+    ResolutionInfo, IdentityInfo, HazardInfo, BodyEffectsInfo, DoseEvaluationInfo,
+    ChemicalVerdict, SafeSkipped, UnverifiedChemical, CombinationRisks,
+    OrganOverlap, CumulativePresence, ProductSummary, GlobalSummary,
+    ExposureEffects, OrganGlobalAnalysis,
+    create_resolution_info, create_identity_info, create_hazard_info,
+    create_body_effects, create_dose_evaluation, create_verdict
+)
 
 
 # ============================================================
@@ -41,7 +44,6 @@ class SyncMCPClient:
         self.process = None
     
     def start(self):
-        """Start the MCP server process (synchronous)"""
         full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), self.server_path)
         self.process = subprocess.Popen(
             [sys.executable, full_path],
@@ -54,7 +56,6 @@ class SyncMCPClient:
         return self
     
     def call(self, tool_name: str, arguments: Dict) -> Dict:
-        """Call a tool synchronously"""
         self.logger.log_tool_call(self.name, tool_name, arguments)
         
         request = {
@@ -89,7 +90,6 @@ class SyncMCPClient:
             return {"error": str(e)}
     
     def list_tools(self) -> List[Dict]:
-        """List available tools"""
         request = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
         request_json = json.dumps(request) + "\n"
         
@@ -108,7 +108,6 @@ class SyncMCPClient:
             return []
     
     def stop(self):
-        """Stop the server process"""
         if self.process:
             self.process.terminate()
             try:
@@ -130,22 +129,27 @@ class StreamlitAgent:
             "evaluation": "servers/evaluation_server/server.py",
         }
         self.token_calls = 0
-        self.max_token_calls = 5  # Limit LLM calls per run
+        self.max_token_calls = 10  # Dynamic budget
+        self.resolution_cache = {}  # Deduplication cache
     
-    def _can_call_llm(self) -> bool:
-        """Check if we can make another LLM call (token budget)"""
+    @lru_cache(maxsize=200)
+    def _cached_resolve(self, name: str) -> dict:
+        """Cached resolve to avoid duplicate KG queries"""
+        if "kg" not in self.clients:
+            return {"unresolved": True, "error": "KG server not available"}
+        return self.clients["kg"].call("resolve_ingredient", {"ingredient_name": name})
+    
+    def _can_call_llm(self, estimated_tokens=300) -> bool:
         if self.token_calls >= self.max_token_calls:
             self.logger.log_step("Token Limit", f"Reached max LLM calls ({self.max_token_calls}) - using fallback", icon="⚠️")
             return False
         return True
     
     def _record_llm_call(self):
-        """Record an LLM call"""
         self.token_calls += 1
         self.logger.log_step("Token Budget", f"LLM call {self.token_calls}/{self.max_token_calls}", icon="💰")
     
     def initialize(self):
-        """Initialize all MCP servers"""
         self.logger.log_step("Initializing MCP Servers", "Connecting to all 4 MCP servers...")
         
         for name, path in self.server_paths.items():
@@ -163,41 +167,60 @@ class StreamlitAgent:
                 self.logger.log_step(f"Server: {name}", f"NOT FOUND at {path}", icon="⚠️")
     
     def shutdown(self):
-        """Shutdown all servers"""
         for client in self.clients.values():
             try:
                 client.stop()
             except:
                 pass
     
-    def _map_h_codes_to_risk(self, h_codes: list) -> str:
-        """Map H-codes to risk level"""
-        critical = {"H340", "H350", "H360"}
-        high = {"H315", "H317", "H318", "H319", "H334"}
-        moderate = {"H302", "H312", "H332", "H335"}
+    def _map_h_codes_to_risk(self, h_codes: list, signal: str = "None") -> str:
+        """
+        Map H-codes and GHS signal to risk level.
         
-        for code in h_codes:
-            if code in critical:
+        Rules:
+        - Danger + Critical H-codes (H340/H350/H360/H370/H372) → CRITICAL
+        - Danger → HIGH
+        - Warning → MODERATE
+        - H-codes present (no signal) → LOW
+        - No hazards → SAFE
+        - Unresolved → UNKNOWN
+        """
+        # Critical H-codes that indicate severe toxicity
+        critical_codes = {
+            "H340", "H341",  # Mutagenicity
+            "H350", "H351",  # Carcinogenicity
+            "H360", "H361", "H362",  # Reproductive toxicity
+            "H370", "H371", "H372", "H373"  # STOT (organ damage)
+        }
+        
+        # Danger signal with critical codes = CRITICAL
+        if signal == "Danger":
+            if any(code in critical_codes for code in h_codes):
                 return "CRITICAL"
-            if code in high:
-                return "HIGH"
-            if code in moderate:
-                return "MODERATE"
-        return "LOW" if h_codes else "UNKNOWN"
-    
+            return "HIGH"
+        
+        # Warning signal = MODERATE
+        if signal == "Warning":
+            return "MODERATE"
+        
+        # No signal but has H-codes = LOW
+        if h_codes:
+            return "LOW"
+        
+        # No hazards = SAFE
+        return "SAFE"
     def evaluate(self, products_list: List[Dict]) -> Dict:
         """Run real evaluation with full MCP tool calls"""
         
-        # Reset token counter for this run
         self.token_calls = 0
+        self.resolution_cache = {}
         
         self.logger.log_step("Input Products", f"Analyzing {len(products_list)} product(s)")
         
         # Phase 1: Product context analysis
         product_count = len(products_list)
         needs_cumulative = product_count >= 2
-        self.logger.log_step("Product Context", 
-                            f"Products: {product_count} | Needs cumulative: {needs_cumulative}")
+        self.logger.log_step("Product Context", f"Products: {product_count} | Needs cumulative: {needs_cumulative}")
         
         # Step 1: Extract all ingredients
         all_ingredients = []
@@ -209,12 +232,11 @@ class StreamlitAgent:
         
         self.logger.log_step("Extract Ingredients", f"Found {len(all_ingredients)} total ingredients")
         
-        # Step 2: Filter ingredients
-        self.logger.log_step("Filtering Ingredients", "Calling filter_server.classify_ingredients...")
-        
-        # Deduplicate ingredients before sending to filter server
+        # Step 2: Deduplicate before filter
         unique_ingredients = list(dict.fromkeys(all_ingredients))
         ingredients_list = [{"name": ing} for ing in unique_ingredients]
+        
+        self.logger.log_step("Filtering Ingredients", "Calling filter_server.classify_ingredients...")
         
         if "filter" in self.clients:
             filter_result = self.clients["filter"].call("classify_ingredients", {
@@ -232,16 +254,15 @@ class StreamlitAgent:
             chemicals = unique_ingredients
             safe_skipped = []
         
-        self.logger.log_step("Filter Results", 
-                            f"🔬 Chemicals: {len(chemicals)} | ✅ Safe skipped: {len(safe_skipped)}")
+        self.logger.log_step("Filter Results", f"🔬 Chemicals: {len(chemicals)} | ✅ Safe skipped: {len(safe_skipped)}")
         
-        # Step 3: KG Investigation per chemical
+        # Step 3: KG Investigation per chemical with deduplication
         self.logger.log_step("Chemical Analysis", f"Processing {len(chemicals)} chemical(s)...")
         
         chemical_findings = []
-        
-        # FIX: Store list of product IDs for each chemical
         chemical_product_map = defaultdict(list)
+        
+        # Build product map
         for product in products_list:
             pid = product.get("product_id", "unknown")
             for ing in product.get("ingredient_list", []):
@@ -249,37 +270,27 @@ class StreamlitAgent:
                 if name in chemicals:
                     chemical_product_map[name].append(pid)
         
-        for chem in chemicals[:20]:  # Limit for performance
+        for chem in chemicals:
             self.logger.log_step(f"Analyzing: {chem}", "", icon="🔬")
             
             if "kg" not in self.clients:
-                self.logger.log_decision(chem, "NO KG SERVER", "KG server not available", "critical")
                 chemical_findings.append({
-                    "name": chem,
-                    "risk_level": "UNKNOWN",
-                    "unresolved": True,
-                    "source": "ERROR",
-                    "confidence": 0.0,
-                    "product_ids": chemical_product_map.get(chem, [])
+                    "name": chem, "risk_level": "UNKNOWN", "unresolved": True,
+                    "source": "ERROR", "confidence": 0.0, "product_ids": chemical_product_map.get(chem, [])
                 })
                 continue
             
-            # Resolve
-            resolve_result = self.clients["kg"].call("resolve_ingredient", {
-                "ingredient_name": chem
-            })
+            # Use cached resolve
+            resolve_result = self._cached_resolve(chem)
             
             if resolve_result.get("unresolved", False):
-                # LLM Fallback for unresolved - respect token budget
-                self.logger.log_decision(chem, "UNRESOLVED", 
-                                        f"Not found in KG.", "moderate")
+                self.logger.log_decision(chem, "UNRESOLVED", f"Not found in KG.", "moderate")
                 
                 llm_estimate = {}
                 if self._can_call_llm() and "evaluation" in self.clients:
                     try:
                         llm_estimate = self.clients["evaluation"].call("estimate_missing_hazards", {
-                            "chemical_name": chem,
-                            "reason": "Not found in KG"
+                            "chemical_name": chem, "reason": "Not found in KG"
                         })
                         self._record_llm_call()
                     except Exception as e:
@@ -289,14 +300,12 @@ class StreamlitAgent:
                 confidence = llm_estimate.get("confidence", 0.3)
                 
                 chemical_findings.append({
-                    "name": chem,
-                    "risk_level": risk_level,
-                    "unresolved": True,
-                    "source": "LLM_ESTIMATE",
-                    "confidence": confidence,
+                    "name": chem, "risk_level": risk_level, "unresolved": True,
+                    "source": "LLM_ESTIMATE", "confidence": confidence,
                     "llm_reasoning": llm_estimate.get("reasoning", ""),
                     "estimated_h_codes": llm_estimate.get("estimated_h_codes", []),
-                    "product_ids": chemical_product_map.get(chem, [])
+                    "product_ids": chemical_product_map.get(chem, []),
+                    "resolution": resolve_result
                 })
                 continue
             
@@ -306,94 +315,75 @@ class StreamlitAgent:
             
             self.logger.log_decision(chem, f"RESOLVED", f"UID: {uid[:20] if uid else 'N/A'}... ({match_strategy})", "low")
             
-            # Get hazard profile
+                        # Get hazard data
             hazard_result = self.clients["kg"].call("get_hazard_profile", {
                 "chemical_uid": uid
             })
-            
+
             h_codes = hazard_result.get("h_codes", [])
             signal = hazard_result.get("highest_signal", "None")
             has_critical = hazard_result.get("has_critical_hazard", False)
-            
-            # Determine risk
-            if has_critical:
-                risk_level = "CRITICAL"
-            elif signal == "Danger":
-                risk_level = "HIGH"
+
+            # CRITICAL H-codes for cross-check
+            critical_h_codes = {"H340", "H350", "H360", "H370", "H372"}
+
+            # CORRECTED RISK MAPPING
+            if signal == "Danger":
+                if has_critical or any(code in critical_h_codes for code in h_codes):
+                    risk_level = "CRITICAL"
+                else:
+                    risk_level = "HIGH"
             elif signal == "Warning":
                 risk_level = "MODERATE"
             elif h_codes:
                 risk_level = "LOW"
             else:
-                risk_level = "LOW"
-            
-            # Get confidence from hazard profile if available
-            hazard_confidence = hazard_result.get("confidence", confidence)
-            final_confidence = hazard_confidence
-            
+                risk_level = "SAFE"
+
+            # Log the decision
             self.logger.log_decision(chem, f"RISK: {risk_level}", 
-                                    f"H-codes: {h_codes[:3]}{'...' if len(h_codes) > 3 else ''} | Signal: {signal} | Conf: {final_confidence:.2f}",
+                                    f"H-codes: {h_codes[:3]}{'...' if len(h_codes) > 3 else ''} | Signal: {signal}",
                                     risk_level.lower())
+
             
             target_organs = []
+            full_profile = {}
             
-            # Deep investigation for HIGH/CRITICAL
             if risk_level in ["HIGH", "CRITICAL"]:
                 self.logger.log_step(f"Deep Investigation: {chem}", "Getting full profile...", icon="🔍")
-                full_profile = self.clients["kg"].call("get_full_profile", {
-                    "chemical_uid": uid
-                })
+                full_profile = self.clients["kg"].call("get_full_profile", {"chemical_uid": uid})
                 target_organs = full_profile.get("target_organs", [])
-                data_confidence = full_profile.get("data_confidence", final_confidence)
-                final_confidence = data_confidence
                 if target_organs:
                     self.logger.log_step(f"Target Organs", f"{chem} affects: {', '.join(target_organs)}", icon="🧠")
             else:
-                # Basic investigation - just get organs
-                organs_result = self.clients["kg"].call("get_target_organs", {
-                    "chemical_uid": uid
-                })
+                organs_result = self.clients["kg"].call("get_target_organs", {"chemical_uid": uid})
                 target_organs = organs_result.get("organs", [])
             
             chemical_findings.append({
-                "name": chem,
-                "risk_level": risk_level,
-                "h_codes": h_codes,
-                "signal": signal,
-                "uid": uid,
-                "unresolved": False,
-                "source": "KG",
-                "confidence": final_confidence,
-                "target_organs": target_organs,
-                "product_ids": chemical_product_map.get(chem, [])
+                "name": chem, "risk_level": risk_level, "h_codes": h_codes, "signal": signal,
+                "uid": uid, "unresolved": False, "source": "KG", "confidence": confidence,
+                "target_organs": target_organs, "product_ids": chemical_product_map.get(chem, []),
+                "resolution": resolve_result, "hazard": hazard_result, "full_profile": full_profile
             })
         
         # Step 4: Combination analysis (global mode)
-        # FIX: Initialize variables BEFORE conditional block
         global_organ_analysis = {}
         cumulative_list = []
         
         if needs_cumulative and len(chemical_findings) >= 2 and "combination" in self.clients:
             self.logger.log_step("Combination Analysis", "Running global organ overlap analysis...", icon="🔄")
             
-            # Build all chemicals with product_id for global analysis
             all_chemicals = []
             for finding in chemical_findings:
-                # Use first product_id from list for global analysis
-                product_ids = finding.get("product_ids", [])
-                for pid in product_ids:
+                for pid in finding.get("product_ids", []):
                     all_chemicals.append({
-                        "name": finding["name"],
-                        "uid": finding.get("uid"),
+                        "name": finding["name"], "uid": finding.get("uid"),
                         "target_organs": finding.get("target_organs", []),
-                        "h_codes": finding.get("h_codes", []),
-                        "product_id": pid
+                        "h_codes": finding.get("h_codes", []), "product_id": pid
                     })
             
-            # Global organ overlap
             overlap_result = self.clients["combination"].call("check_organ_overlap", {
-                "chemicals": all_chemicals,
-                "global_mode": True
+                "chemicals": all_chemicals, "global_mode": True
             })
             
             global_organ_analysis = overlap_result.get("global_organ_analysis", {})
@@ -403,22 +393,14 @@ class StreamlitAgent:
                 self.logger.log_step("Global Organ Analysis", "", icon="🧠")
                 for organ, data in global_organ_analysis.items():
                     self.logger.log_step(f"Organ: {organ}", 
-                                        f"Unique chemicals: {data.get('total_unique_count', 0)} | "
-                                        f"Chemicals: {', '.join(data.get('unique_chemicals', [])[:5])}",
-                                        icon="📊")
+                                        f"Unique chemicals: {data.get('total_unique_count', 0)}", icon="📊")
             
             if escalation == "HIGH":
-                self.logger.log_step("Escalation Enforced", 
-                                    "verdict_escalation = HIGH - forcing product risk levels", 
-                                    icon="⚠️")
                 for finding in chemical_findings:
                     if finding.get("risk_level") in ["HIGH", "MODERATE"]:
                         finding["risk_level"] = "HIGH"
             
             # Cumulative presence
-            self.logger.log_step("Cumulative Presence", "Checking for chemicals in multiple products...", icon="📦")
-            
-            # Build product frequency
             product_chemicals = {}
             for product in products_list:
                 pid = product.get("product_id", "unknown")
@@ -439,9 +421,7 @@ class StreamlitAgent:
                         products_with_chem.append({"product_id": pid, "product_name": data["name"]})
                 if count >= 2:
                     cumulative_list.append({
-                        "chemical_name": name,
-                        "frequency": count,
-                        "products": products_with_chem
+                        "chemical_name": name, "frequency": count, "products": products_with_chem
                     })
             
             if cumulative_list:
@@ -449,62 +429,222 @@ class StreamlitAgent:
                     self.logger.log_step(f"Cumulative: {cum['chemical_name']}", 
                                         f"Appears in {cum['frequency']} products", icon="⚠️")
         
-        # Step 5: Build final report
-        self.logger.log_step("Synthesizing Report", "Generating final safety assessment...", icon="📝")
+        # ============================================================
+        # STEP 5: BUILD FINAL REPORT USING output_schema.py STRUCTURE
+        # ============================================================
+        self.logger.log_step("Synthesizing Report", "Building schema-compliant report...", icon="📝")
         
-        # Group by product
+        report_id = f"rpt_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        analyzed_at = datetime.now().isoformat()
+        
+        # Convert global_organ_analysis to OrganGlobalAnalysis format
+        schema_global_analysis = {}
+        for organ, data in global_organ_analysis.items():
+            schema_global_analysis[organ] = OrganGlobalAnalysis(
+                unique_chemicals=data.get("unique_chemicals", []),
+                total_unique_count=data.get("total_unique_count", 0),
+                chemical_frequency=data.get("chemical_frequency", {}),
+                products_per_chemical=data.get("products_per_chemical", {})
+            )
+        
         products_output = []
+        
         for product in products_list:
             pid = product.get("product_id", "unknown")
             pname = product.get("product_name", "Unknown Product")
             usage = product.get("product_usage", "unknown")
-            exposure = [product.get("exposure_type", "unknown")] if product.get("exposure_type") else []
+            exposure_type = [product.get("exposure_type", "unknown")] if product.get("exposure_type") else []
             
-            product_findings = [f for f in chemical_findings if pid in f.get("product_ids", [])]
+            product_ingredients = {ing.get("name", "").upper() for ing in product.get("ingredient_list", [])}
             
-            high_risk = [f for f in product_findings if f["risk_level"] in ["CRITICAL", "HIGH"]]
-            moderate_risk = [f for f in product_findings if f["risk_level"] == "MODERATE"]
+            chemicals_evaluated = []
+            safe_skipped_list = []
+            unverified_list = []
+            drivers = []
             
-            if high_risk:
-                overall_risk = "HIGH"
-                recommendation = "avoid"
-            elif moderate_risk:
-                overall_risk = "MODERATE"
-                recommendation = "reduce_use"
+            for f in chemical_findings:
+                if f.get("name", "").upper() not in product_ingredients:
+                    continue
+                
+                chem_name = f.get("name", "")
+                
+                if f.get("risk_level") in ["CRITICAL", "HIGH"]:
+                    drivers.append(chem_name)
+                
+                # Use builder functions from output_schema.py
+                resolution_info = create_resolution_info(
+                    f.get("resolution", {}),
+                    f.get("confidence", 0.5)
+                )
+                
+                identity_info = create_identity_info(f.get("full_profile", {}))
+                
+                hazard_info = create_hazard_info(f.get("hazard", {}))
+                
+                body_effects = create_body_effects(f.get("full_profile", {}))
+                
+                dose_eval = create_dose_evaluation(f.get("exposure_limits", {}))
+                
+                justifications = []
+                if f.get("llm_reasoning"):
+                    justifications.append(f.get("llm_reasoning"))
+                if f.get("reasoning"):
+                    justifications.append(f.get("reasoning"))
+                if not justifications:
+                    justifications.append(f"Risk level: {f.get('risk_level', 'UNKNOWN')}")
+                
+                verdict = create_verdict(f.get("risk_level", "UNKNOWN"), justifications)
+                
+                chemicals_evaluated.append(ChemicalEvaluation(
+                    name=chem_name,
+                    uid=f.get("uid"),
+                    cas=f.get("resolution", {}).get("cas") if f.get("resolution") else None,
+                    resolution=resolution_info,
+                    identity=identity_info,
+                    hazard=hazard_info,
+                    body_effects=body_effects,
+                    dose_evaluation=dose_eval,
+                    verdict=verdict
+                ))
+            
+            # Safe skipped
+            for safe in safe_skipped:
+                safe_name = safe
+                if safe_name.upper() in product_ingredients:
+                    safe_skipped_list.append(SafeSkipped(
+                        name=safe_name,
+                        reason="Classified as non-chemical"
+                    ))
+            
+            # Unverified
+            for f in chemical_findings:
+                if f.get("unresolved") and f.get("name", "").upper() in product_ingredients:
+                    unverified_list.append(UnverifiedChemical(
+                        name=f.get("name", ""),
+                        reason=f.get("llm_reasoning", "Not found in Knowledge Graph"),
+                        flag="unverified_chemical"
+                    ))
+            
+            # Per-product organ overlaps
+            product_specific_overlaps = []
+            for organ, data in global_organ_analysis.items():
+                chem_list = []
+                for chem, prods in data.get("products_per_chemical", {}).items():
+                    if pid in prods:
+                        chem_list.append(chem)
+                if chem_list:
+                    product_specific_overlaps.append({
+                        "organ": organ,
+                        "chemicals": chem_list,
+                        "count": len(chem_list)
+                    })
+            
+            organ_overlap_obj = OrganOverlap(
+                fetch_status="done",
+                has_overlap=len(product_specific_overlaps) > 0,
+                verdict_escalation=overlap_result.get("verdict_escalation") if 'overlap_result' in dir() else None,
+                overlapping_organs=product_specific_overlaps if product_specific_overlaps else None,
+                note=overlap_result.get("summary") if 'overlap_result' in dir() else None,
+                error_message=None
+            )
+            
+            cumulative_obj = CumulativePresence(
+                fetch_status="done" if cumulative_list else "skipped",
+                checked=len(cumulative_list) > 0,
+                note=f"{len(cumulative_list)} chemical(s) in multiple products" if cumulative_list else "No cumulative concerns"
+            )
+            
+            combination_risks = CombinationRisks(
+                organ_overlap=organ_overlap_obj,
+                cumulative_presence=cumulative_obj
+            )
+            
+            risk_counts = {"CRITICAL": 0, "HIGH": 0, "MODERATE": 0, "LOW": 0, "SAFE": 0, "UNKNOWN": 0}
+            for c in chemicals_evaluated:
+                risk = c.verdict.danger_level
+                if risk in risk_counts:
+                    risk_counts[risk] += 1
+            
+            summary = ProductSummary(
+                total_ingredients=len(product.get("ingredient_list", [])),
+                chemicals_evaluated=len(chemicals_evaluated),
+                safe_skipped=len(safe_skipped_list),
+                unverified=len(unverified_list),
+                critical=risk_counts["CRITICAL"],
+                high=risk_counts["HIGH"],
+                moderate=risk_counts["MODERATE"],
+                low=risk_counts["LOW"],
+                safe=risk_counts["SAFE"],
+                unknown=risk_counts["UNKNOWN"],
+                organ_overlap_flags=1 if product_specific_overlaps else 0
+            )
+            
+            products_output.append(ProductOutput(
+                product_id=pid,
+                product_name=pname,
+                usage=usage,
+                exposure_type=exposure_type,
+                drivers=drivers[:5],
+                ingredients=IngredientsSection(
+                    chemicals_evaluated=chemicals_evaluated,
+                    safe_skipped=safe_skipped_list,
+                    unverified_chemicals=unverified_list
+                ),
+                combination_risks=combination_risks,
+                summary=summary
+            ))
+        
+        # Build global summary
+        all_critical = [f.get("name") for f in chemical_findings if f.get("risk_level") == "CRITICAL"]
+        all_high = [f.get("name") for f in chemical_findings if f.get("risk_level") == "HIGH"]
+        all_organs = set()
+        for f in chemical_findings:
+            for organ in f.get("target_organs", []):
+                all_organs.add(organ)
+        
+        global_summary = GlobalSummary(
+            total_products=len(products_list),
+            products_to_avoid=sum(1 for p in products_output if p.summary.critical > 0 or p.summary.high > 0),
+            products_to_reduce=sum(1 for p in products_output if p.summary.moderate > 0),
+            products_safe=sum(1 for p in products_output if p.summary.critical == 0 and p.summary.high == 0 and p.summary.moderate == 0),
+            products_unknown=sum(1 for p in products_output if p.summary.unknown > 0),
+            unique_chemicals_found=len(set(f.get("name") for f in chemical_findings)),
+            critical_chemicals=all_critical[:10],
+            high_chemicals=all_high[:10],
+            organs_under_pressure=list(all_organs)[:10] if all_organs else None,
+            depth_used="full",
+            organ_global_analysis=schema_global_analysis
+        )
+        
+        final_report = FinalReport(
+            report_id=report_id,
+            analyzed_at=analyzed_at,
+            agent_version="2.0.0",
+            no_dose_data=True,
+            depth="full",
+            products=products_output,
+            global_summary=global_summary
+        )
+        
+        # Convert to dict for JSON serialization
+        def to_dict(obj):
+            if hasattr(obj, '__dataclass_fields__'):
+                return {k: to_dict(v) for k, v in obj.__dict__.items()}
+            elif isinstance(obj, list):
+                return [to_dict(i) for i in obj]
+            elif isinstance(obj, dict):
+                return {k: to_dict(v) for k, v in obj.items()}
             else:
-                overall_risk = "LOW"
-                recommendation = "keep"
-            
-            products_output.append({
-                "product_id": pid,
-                "product_name": pname,
-                "risk_level": overall_risk,
-                "recommendation": recommendation,
-                "chemicals": product_findings
-            })
+                return obj
         
-        # Build final report
-        all_high_risk = [f["name"] for f in chemical_findings if f["risk_level"] in ["CRITICAL", "HIGH"]]
-        all_moderate_risk = [f["name"] for f in chemical_findings if f["risk_level"] == "MODERATE"]
+        result = to_dict(final_report)
+        result["llm_calls_used"] = self.token_calls
         
-        report = {
-            "analyzed_at": datetime.now().isoformat(),
-            "products_count": len(products_list),
-            "chemicals_analyzed": len(chemical_findings),
-            "llm_calls_used": self.token_calls,
-            "products": products_output,
-            "high_risk_chemicals": all_high_risk[:10],
-            "moderate_risk_chemicals": all_moderate_risk[:10],
-            "global_organ_analysis": global_organ_analysis if needs_cumulative else {},
-            "cumulative_chemicals": cumulative_list if needs_cumulative else []
-        }
-        
-        return report
+        return result
 
 
 class StreamlitLogger:
-    """Logs agent reasoning to Streamlit interface with visual elements"""
-    
+    # ... (keep your existing StreamlitLogger class)
     def __init__(self):
         self.step_num = 0
         self.start_time = None
@@ -543,14 +683,12 @@ class StreamlitLogger:
     
     def log_decision(self, chemical: str, decision: str, reason: str, risk_color: str = "blue"):
         colors = {
-            "critical": "#ffebee",
-            "high": "#fff3e0",
-            "moderate": "#fff8e1",
-            "low": "#e8f5e9",
-            "blue": "#e3f2fd"
+            "critical": "#ffebee", "high": "#fff3e0", "moderate": "#fff8e1",
+            "low": "#e8f5e9", "blue": "#e3f2fd"
         }
         bg = colors.get(risk_color, "#f5f5f5")
-        border = {"critical": "#f44336", "high": "#ff9800", "moderate": "#ffc107", "low": "#4caf50", "blue": "#2196f3"}.get(risk_color, "#2196f3")
+        border = {"critical": "#f44336", "high": "#ff9800", "moderate": "#ffc107", 
+                  "low": "#4caf50", "blue": "#2196f3"}.get(risk_color, "#2196f3")
         with st.container():
             st.markdown(f"""
             <div style="background-color: {bg}; border-radius: 10px; padding: 12px; margin: 8px 0; border-left: 4px solid {border};">
@@ -578,7 +716,6 @@ class StreamlitLogger:
 # ============================================================
 
 def clean_json_input(raw_text: str) -> str:
-    """Clean and extract JSON from raw input"""
     import re
     raw_text = raw_text.strip()
     if raw_text.startswith("[PRODUCTS_LIST]"):
@@ -590,7 +727,6 @@ def clean_json_input(raw_text: str) -> str:
 
 
 def parse_input(raw_text: str) -> tuple:
-    """Parse input and return products_list"""
     try:
         cleaned = clean_json_input(raw_text)
         data = json.loads(cleaned)
@@ -611,63 +747,50 @@ def parse_input(raw_text: str) -> tuple:
 
 
 def format_report_display(report: dict):
-    """Display report in a readable format"""
-    
     st.subheader("📊 Analysis Results")
     
-    # Overall stats
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Products Analyzed", report.get("products_count", 0))
+        st.metric("Products Analyzed", len(report.get("products", [])))
     with col2:
-        st.metric("Chemicals Analyzed", report.get("chemicals_analyzed", 0))
+        st.metric("Chemicals Analyzed", sum(len(p.get("ingredients", {}).get("chemicals_evaluated", [])) for p in report.get("products", [])))
     with col3:
-        high_count = len(report.get("high_risk_chemicals", []))
-        st.metric("High Risk Chemicals", high_count, delta="⚠️" if high_count > 0 else None)
+        high_count = len(report.get("global_summary", {}).get("high_chemicals", []))
+        st.metric("High Risk Chemicals", high_count)
     
-    # Show LLM usage
-    llm_calls = report.get("llm_calls_used", 0)
-    st.caption(f"🤖 LLM calls used: {llm_calls}/5")
+    st.caption(f"LLM calls used: {report.get('llm_calls_used', 0)}")
     
-    # High risk chemicals
-    if report.get("high_risk_chemicals"):
-        st.error(f"⚠️ High Risk Chemicals: {', '.join(report['high_risk_chemicals'])}")
-    
-    if report.get("moderate_risk_chemicals"):
-        st.warning(f"⚠️ Moderate Risk Chemicals: {', '.join(report['moderate_risk_chemicals'])}")
-    
-    # Product verdicts
+    # Show product verdicts
     st.subheader("📦 Product Verdicts")
     for product in report.get("products", []):
-        risk = product.get("risk_level", "UNKNOWN")
+        risk = "UNKNOWN"
+        for c in product.get("ingredients", {}).get("chemicals_evaluated", []):
+            if c.get("verdict", {}).get("danger_level") in ["CRITICAL", "HIGH"]:
+                risk = "HIGH"
+                break
+            elif c.get("verdict", {}).get("danger_level") == "MODERATE":
+                risk = "MODERATE"
+            else:
+                risk = "LOW"
+        
         if risk == "HIGH":
-            st.error(f"**{product.get('product_name', 'Unknown')}** → 🔴 HIGH RISK - {product.get('recommendation', '').upper()}")
+            st.error(f"**{product.get('product_name', 'Unknown')}** → 🔴 HIGH RISK")
         elif risk == "MODERATE":
-            st.warning(f"**{product.get('product_name', 'Unknown')}** → 🟡 MODERATE RISK - {product.get('recommendation', '').upper()}")
+            st.warning(f"**{product.get('product_name', 'Unknown')}** → 🟡 MODERATE RISK")
         else:
-            st.success(f"**{product.get('product_name', 'Unknown')}** → 🟢 LOW RISK - {product.get('recommendation', '').upper()}")
+            st.success(f"**{product.get('product_name', 'Unknown')}** → 🟢 LOW RISK")
     
     # Global organ analysis
-    if report.get("global_organ_analysis"):
+    global_analysis = report.get("global_summary", {}).get("organ_global_analysis", {})
+    if global_analysis:
         st.subheader("🧠 Global Organ Analysis")
-        for organ, data in report["global_organ_analysis"].items():
+        for organ, data in global_analysis.items():
             st.info(f"**{organ.capitalize()}**: {data.get('total_unique_count', 0)} unique chemicals")
-            with st.expander(f"View details for {organ}"):
+            with st.expander(f"View details"):
                 st.json(data)
-    
-    # Cumulative chemicals
-    if report.get("cumulative_chemicals"):
-        st.subheader("📦 Cumulative Exposure")
-        for cum in report["cumulative_chemicals"]:
-            st.warning(f"⚠️ **{cum.get('chemical_name')}** appears in {cum.get('frequency')} products")
 
-
-# ============================================================
-# MAIN STREAMLIT APP
-# ============================================================
 
 def run_agent_sync(products_list: List[Dict], logger: StreamlitLogger) -> Dict:
-    """Run agent synchronously (for Streamlit)"""
     agent = StreamlitAgent(logger)
     try:
         agent.initialize()
@@ -678,67 +801,41 @@ def run_agent_sync(products_list: List[Dict], logger: StreamlitLogger) -> Dict:
 
 
 def main():
-    st.set_page_config(
-        page_title="Biological Agent - Chemical Safety Analysis",
-        page_icon="🧪",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
+    st.set_page_config(page_title="Biological Agent", page_icon="🧪", layout="wide")
     
     st.title("🧪 Biological Agent")
     st.markdown("*AI-powered chemical safety analysis for consumer products*")
-    st.caption("Using real MCP servers (KG, Filter, Combination, Evaluation) with Neo4j + Groq")
+    st.caption("Using real MCP servers (KG, Filter, Combination, Evaluation)")
     
-    # Sidebar for input
     with st.sidebar:
         st.header("📤 Input")
         
-        input_method = st.radio(
-            "Choose input method:",
-            ["📋 Example Product", "📁 Upload JSON", "✏️ Paste JSON"],
-            help="Select how to provide product data"
-        )
+        input_method = st.radio("Choose input method:", ["📋 Example Product", "📁 Upload JSON", "✏️ Paste JSON"])
         
         products_list = None
         
         if input_method == "📋 Example Product":
             example = {
                 "products_list": [
-                    {
-                        "product_id": "1",
-                        "product_name": "Moisturizing Cream",
-                        "product_usage": "cosmetics",
-                        "exposure_type": "skin",
-                        "ingredient_list": [
-                            {"name": "AQUA"},
-                            {"name": "SODIUM LAURETH SULFATE"},
-                            {"name": "COCO-BETAINE"},
-                            {"name": "SODIUM CHLORIDE"},
-                            {"name": "PARFUM"},
-                            {"name": "CITRIC ACID"}
-                        ]
-                    },
-                    {
-                        "product_id": "2",
-                        "product_name": "Perfume Spray",
-                        "product_usage": "cosmetics",
-                        "exposure_type": "skin",
-                        "ingredient_list": [
-                            {"name": "ALCOHOL DENAT."},
-                            {"name": "PARFUM"},
-                            {"name": "LIMONENE"},
-                            {"name": "LINALOOL"}
-                        ]
-                    }
+                    {"product_id": "1", "product_name": "Moisturizing Cream",
+                     "product_usage": "cosmetics", "exposure_type": "skin",
+                     "ingredient_list": [
+                         {"name": "AQUA"}, {"name": "SODIUM LAURETH SULFATE"},
+                         {"name": "PARFUM"}, {"name": "GLYCERIN"}
+                     ]},
+                    {"product_id": "2", "product_name": "Perfume Spray",
+                     "product_usage": "cosmetics", "exposure_type": "skin",
+                     "ingredient_list": [
+                         {"name": "ALCOHOL DENAT."}, {"name": "PARFUM"},
+                         {"name": "LIMONENE"}, {"name": "LINALOOL"}
+                     ]}
                 ]
             }
             products_list = example["products_list"]
             st.success("Using example with 2 products")
-            with st.expander("View example JSON"):
-                st.json(example)
         
         elif input_method == "📁 Upload JSON":
-            uploaded_file = st.file_uploader("Upload JSON file", type=["json"])
+            uploaded_file = st.file_uploader("Upload JSON", type=["json"])
             if uploaded_file:
                 try:
                     content = uploaded_file.read().decode()
@@ -751,13 +848,8 @@ def main():
                 except Exception as e:
                     st.error(f"Error reading file: {e}")
         
-        else:  # Paste JSON
-            json_text = st.text_area(
-                "Paste JSON here:",
-                height=250,
-                placeholder='{"products_list": [{"product_id": "1", "ingredient_list": [{"name": "AQUA"}], "product_usage": "cosmetics", "exposure_type": "skin"}]}',
-                help="Paste valid JSON with products_list array"
-            )
+        else:
+            json_text = st.text_area("Paste JSON:", height=250)
             if json_text:
                 success, data, error = parse_input(json_text)
                 if success:
@@ -766,25 +858,16 @@ def main():
                 else:
                     st.error(error)
         
-        st.divider()
-        
-        st.header("⚙️ Settings")
-        show_detailed_logs = st.checkbox("Show detailed tool calls", value=True)
-        
         analyze_button = st.button("🚀 Analyze Products", type="primary", use_container_width=True)
     
-    # Main area
     if analyze_button and products_list:
-        st.session_state.analysis_complete = False
-        
         logger = StreamlitLogger()
         logger.start()
         
-        with st.spinner("Agent is analyzing products... This may take 10-30 seconds..."):
+        with st.spinner("Agent is analyzing products..."):
             try:
                 report = run_agent_sync(products_list, logger)
                 elapsed = logger.finish(report.get("elapsed_s", 0))
-                st.session_state.analysis_complete = True
                 st.session_state.report = report
                 st.session_state.elapsed = elapsed
             except Exception as e:
@@ -792,47 +875,15 @@ def main():
                 import traceback
                 st.code(traceback.format_exc())
     
-    if st.session_state.get("analysis_complete"):
-        report = st.session_state.report
+    if st.session_state.get("report"):
+        format_report_display(st.session_state.report)
         
-        format_report_display(report)
-        
-        st.divider()
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.caption(f"Analysis completed in {st.session_state.elapsed:.1f} seconds")
-        with col2:
-            st.download_button(
-                label="📥 Download Full Report (JSON)",
-                data=json.dumps(report, indent=2),
-                file_name=f"biological_agent_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json"
-            )
-        
-        with st.expander("📄 View Raw JSON Report"):
-            st.json(report)
-    
-    elif not analyze_button:
-        st.info("👈 Select input method and click **Analyze Products** to start")
-        
-        with st.expander("📖 Input Format Example"):
-            st.code("""
-{
-  "products_list": [
-    {
-      "product_id": "1",
-      "product_name": "Moisturizing Cream (optional)",
-      "product_usage": "cosmetics",
-      "exposure_type": "skin",
-      "ingredient_list": [
-        {"name": "AQUA"},
-        {"name": "SODIUM LAURETH SULFATE"},
-        {"name": "PARFUM"}
-      ]
-    }
-  ]
-}
-            """, language="json")
+        st.download_button(
+            label="📥 Download Report (JSON)",
+            data=json.dumps(st.session_state.report, indent=2),
+            file_name=f"biological_agent_report.json",
+            mime="application/json"
+        )
 
 
 if __name__ == "__main__":
